@@ -37,7 +37,7 @@ pub trait NodeContext {
     const REQUEST_TIMEOUT: u64;
 
     /// Max number of simultaneous connections we initiates we are willing to hold
-    const MAX_OUTGOING_PEERS: usize = 10;
+    const MAX_OUTGOING_PEERS: usize = 100;
 
     /// We ask for peers every ASK_FOR_PEERS_INTERVAL seconds
     const ASK_FOR_PEERS_INTERVAL: u64 = 60 * 60; // One hour

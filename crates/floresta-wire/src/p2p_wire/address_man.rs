@@ -836,6 +836,10 @@ impl AddressMan {
 
     /// Dumps the connected utreexo peers to a file on dir `datadir/anchors.json` in json format `
     /// inputs are the directory to save the file and the list of ids of the connected utreexo peers
+    ///
+    /// `peers_id` holds **address ids**, the same ids we key our addresses with. If we can't
+    /// resolve any of them, we keep the anchors already on disk: overwriting them with an empty
+    /// list would leave us with nothing to reconnect to on our next startup.
     pub fn dump_utreexo_peers(
         &self,
         datadir: impl AsRef<Path>,
@@ -843,10 +847,19 @@ impl AddressMan {
     ) -> std::io::Result<()> {
         let datadir = datadir.as_ref();
 
-        let addresses: Vec<DiskLocalAddress> = peers_id
-            .iter()
-            .filter_map(|id| Some(self.addresses.get(id)?.to_owned().into()))
-            .collect();
+        let mut addresses: Vec<DiskLocalAddress> = Vec::with_capacity(peers_id.len());
+        for id in peers_id {
+            match self.addresses.get(id) {
+                Some(address) => addresses.push(address.to_owned().into()),
+                None => warn!("Not saving anchor {id}: we don't know any address with this id"),
+            }
+        }
+
+        if addresses.is_empty() {
+            warn!("No utreexo anchors to save, keeping the ones we already have on disk");
+            return Ok(());
+        }
+
         let addresses: Result<String, serde_json::Error> = serde_json::to_string(&addresses);
         if let Ok(addresses) = addresses {
             std::fs::write(datadir.join("anchors.json"), addresses)?;

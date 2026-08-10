@@ -765,19 +765,32 @@ where
     /// anchors already on disk, since overwriting them with an empty list would leave us with
     /// nothing to reconnect to on the next startup.
     pub(crate) fn save_utreexo_peers(&self) -> Result<(), WireError> {
-        let peers_usize: Vec<usize> = self
+        // `peer_by_service` is keyed by connection id, but our address book is keyed by
+        // address id. Those are two different id spaces, so translate one into the other
+        // through the peers we have connected.
+        let connections = self
             .peer_by_service
             .get(&service_flags::UTREEXO.into())
-            .map(|peers| peers.iter().map(|&peer| peer as usize).collect())
+            .map(Vec::as_slice)
             .unwrap_or_default();
 
-        if peers_usize.is_empty() {
+        let mut anchors = Vec::with_capacity(connections.len());
+        for peer in connections {
+            match self.peers.get(peer) {
+                Some(peer_data) => anchors.push(peer_data.address.id),
+                // We drop peers from `peer_by_service` as soon as they disconnect, so we only
+                // get here if the two ever get out of sync
+                None => debug!("Not saving peer {peer} as an anchor: it isn't connected"),
+            }
+        }
+
+        if anchors.is_empty() {
             warn!("No connected Utreexo peers to save to disk");
             return Ok(());
         }
         info!("Saving utreexo peers to disk...");
         self.address_man
-            .dump_utreexo_peers(&self.datadir, &peers_usize)
+            .dump_utreexo_peers(&self.datadir, &anchors)
             .map_err(WireError::Io)
     }
 
@@ -1015,9 +1028,11 @@ mod tests {
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use floresta_chain::FlatChainStoreConfig;
+    use floresta_common::Ema;
     use floresta_mempool::Mempool;
     use tokio::sync::Mutex;
     use tokio::sync::RwLock;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::UtreexoNodeConfig;
@@ -1025,11 +1040,21 @@ mod tests {
     use crate::address_man::DiskLocalAddress;
     use crate::address_man::ReachableNetworks;
     use crate::node::sync_ctx::SyncNode;
+    use crate::p2p_wire::transport::TransportProtocol;
 
     type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>;
 
-    /// The id of the only address our test nodes know about
-    const PEER_ID: usize = 0;
+    /// The address id of the only address our test nodes know about
+    const ADDRESS_ID: usize = 0;
+
+    /// The connection id of the peer we connect with
+    ///
+    /// Connection ids are handed out by the node itself and have nothing to do with the address
+    /// ids our address book uses, so we pick one that can't be mistaken for `ADDRESS_ID`.
+    const CONNECTION_ID: u32 = 427;
+
+    /// An address id our address book doesn't know anything about
+    const UNKNOWN_ADDRESS_ID: usize = 1234;
 
     /// The anchors a previous run of the node would have left on disk
     const OLD_ANCHORS: &str = "the anchors we saved on our last run";
@@ -1041,7 +1066,18 @@ mod tests {
             0,
             AddressState::NeverTried,
             ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | service_flags::UTREEXO.into(),
-            PEER_ID,
+            ADDRESS_ID,
+        )
+    }
+
+    /// Another routable utreexo address, so we can tell one address id apart from another
+    fn other_utreexo_address(id: usize) -> LocalAddress {
+        LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::Ipv4(Ipv4Addr::new(100, 50, 25, 12)), 8333),
+            0,
+            AddressState::NeverTried,
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | service_flags::UTREEXO.into(),
+            id,
         )
     }
 
@@ -1086,6 +1122,36 @@ mod tests {
         (node, datadir)
     }
 
+    /// Registers `address` as a connected utreexo peer, reachable by `connection_id`
+    ///
+    /// This is what `handle_peer_ready` leaves behind once a utreexo peer finishes handshaking.
+    fn connect_utreexo_peer(node: &mut TestNode, connection_id: u32, address: LocalAddress) {
+        let (channel, _) = unbounded_channel();
+
+        node.peers.insert(
+            connection_id,
+            LocalPeerView {
+                message_times: Ema::with_half_life_50(),
+                state: PeerStatus::Ready,
+                channel,
+                services: service_flags::UTREEXO.into(),
+                user_agent: String::new(),
+                address,
+                _last_message: Instant::now(),
+                kind: ConnectionKind::Regular(service_flags::UTREEXO.into()),
+                height: 0,
+                time_offset: 0,
+                banscore: 0,
+                transport_protocol: TransportProtocol::V2,
+            },
+        );
+
+        node.peer_by_service
+            .entry(service_flags::UTREEXO.into())
+            .or_default()
+            .push(connection_id);
+    }
+
     fn read_anchors(datadir: &Path) -> Vec<LocalAddress> {
         let anchors = std::fs::read_to_string(datadir.join("anchors.json")).unwrap();
         serde_json::from_str::<Vec<DiskLocalAddress>>(&anchors)
@@ -1120,8 +1186,7 @@ mod tests {
     #[test]
     fn test_save_utreexo_peers_dumps_connected_peers() {
         let (mut node, datadir) = setup_node();
-        node.peer_by_service
-            .insert(service_flags::UTREEXO.into(), vec![PEER_ID as u32]);
+        connect_utreexo_peer(&mut node, CONNECTION_ID, utreexo_address());
 
         node.save_utreexo_peers().expect("should dump our anchors");
 
@@ -1139,11 +1204,48 @@ mod tests {
         assert!(peers.exists());
         assert!(!anchors.exists());
 
-        node.peer_by_service
-            .insert(service_flags::UTREEXO.into(), vec![PEER_ID as u32]);
+        connect_utreexo_peer(&mut node, CONNECTION_ID, utreexo_address());
 
         node.save_peer_dbs().expect("should dump both dbs");
         assert!(peers.exists());
         assert_eq!(read_anchors(&datadir), vec![utreexo_address()]);
+    }
+
+    /// Connection ids and address ids are two different id spaces, and a peer's connection id
+    /// means nothing to our address book. If we ever look one up as if it were the other, we
+    /// either save no anchor at all, or an address we aren't even connected with.
+    #[test]
+    fn test_save_utreexo_peers_doesnt_mix_up_id_spaces() {
+        let (mut node, datadir) = setup_node();
+        std::fs::write(datadir.join("anchors.json"), OLD_ANCHORS).unwrap();
+
+        // An address we know about, but aren't connected with. Its address id happens to be
+        // the same number as the connection id of the peer we *are* connected with.
+        let stranger = other_utreexo_address(CONNECTION_ID as usize);
+        node.address_man.push_addresses(&[stranger]);
+
+        connect_utreexo_peer(&mut node, CONNECTION_ID, utreexo_address());
+        node.save_utreexo_peers().expect("should dump our anchors");
+
+        // We must save the peer we're connected with, never the address that just happens to
+        // collide with its connection id, and never an empty list
+        assert_eq!(read_anchors(&datadir), vec![utreexo_address()]);
+    }
+
+    /// An anchor we can't find in our address book, say because we've pruned it, must not wipe
+    /// the anchors we already have on disk
+    #[test]
+    fn test_save_utreexo_peers_keeps_old_anchors_for_unknown_addresses() {
+        let (mut node, datadir) = setup_node();
+        let anchors = datadir.join("anchors.json");
+        std::fs::write(&anchors, OLD_ANCHORS).unwrap();
+
+        let unknown = other_utreexo_address(UNKNOWN_ADDRESS_ID);
+        connect_utreexo_peer(&mut node, CONNECTION_ID, unknown);
+
+        node.save_utreexo_peers()
+            .expect("not knowing an address isn't an error");
+
+        assert_eq!(std::fs::read_to_string(&anchors).unwrap(), OLD_ANCHORS);
     }
 }
