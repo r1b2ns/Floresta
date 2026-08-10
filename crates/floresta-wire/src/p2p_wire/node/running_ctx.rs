@@ -416,11 +416,7 @@ where
         // Jobs that don't need a connected peer
         try_and_log!(self.process_pending_blocks());
 
-        // Save our peers db
-        periodic_job!(
-            self.last_peer_db_dump => self.save_peers(),
-            RunningNode::PEER_DB_DUMP_INTERVAL,
-        );
+        self.common_periodic_jobs();
 
         // Rework our address database
         periodic_job!(

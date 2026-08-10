@@ -854,6 +854,8 @@ where
             return Ok(LoopControl::Break);
         }
 
+        self.common_periodic_jobs();
+
         // Checks if we need to open a new connection
         periodic_job!(
             self.last_connection => self.maybe_open_connection(ServiceFlags::NONE),

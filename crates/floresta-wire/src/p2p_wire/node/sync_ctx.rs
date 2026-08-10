@@ -247,6 +247,8 @@ where
             return LoopControl::Break;
         }
 
+        self.common_periodic_jobs();
+
         periodic_job!(
             self.last_connection => self.check_connections(),
             SyncNode::TRY_NEW_CONNECTION,

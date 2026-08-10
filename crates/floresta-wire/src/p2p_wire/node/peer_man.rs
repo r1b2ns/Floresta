@@ -760,12 +760,17 @@ where
     }
 
     /// Saves the utreexo peers to disk so we can reconnect with them later
+    ///
+    /// Having no utreexo peer connected is a normal state, not an error: we simply keep the
+    /// anchors already on disk, since overwriting them with an empty list would leave us with
+    /// nothing to reconnect to on the next startup.
     pub(crate) fn save_utreexo_peers(&self) -> Result<(), WireError> {
-        let peers: &Vec<u32> = self
+        let peers_usize: Vec<usize> = self
             .peer_by_service
             .get(&service_flags::UTREEXO.into())
-            .ok_or(WireError::NoUtreexoPeersAvailable)?;
-        let peers_usize: Vec<usize> = peers.iter().map(|&peer| peer as usize).collect();
+            .map(|peers| peers.iter().map(|&peer| peer as usize).collect())
+            .unwrap_or_default();
+
         if peers_usize.is_empty() {
             warn!("No connected Utreexo peers to save to disk");
             return Ok(());
@@ -774,6 +779,12 @@ where
         self.address_man
             .dump_utreexo_peers(&self.datadir, &peers_usize)
             .map_err(WireError::Io)
+    }
+
+    /// Persist both peer databases: the general address book and the utreexo anchors
+    pub(crate) fn save_peer_dbs(&self) -> Result<(), WireError> {
+        self.save_peers()?;
+        self.save_utreexo_peers()
     }
 
     // === METRICS AND HELPERS ===
@@ -988,5 +999,151 @@ where
         // Return true if exists or false if anything fails during connection
         // We allow V1 fallback iff the `v2` flag is not set
         self.open_connection(kind, local_address, !v2_transport)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use bitcoin::Network;
+    use bitcoin::p2p::address::AddrV2;
+    use floresta_chain::AssumeValidArg;
+    use floresta_chain::ChainState;
+    use floresta_chain::FlatChainStore;
+    use floresta_chain::FlatChainStoreConfig;
+    use floresta_mempool::Mempool;
+    use tokio::sync::Mutex;
+    use tokio::sync::RwLock;
+
+    use super::*;
+    use crate::UtreexoNodeConfig;
+    use crate::address_man::AddressMan;
+    use crate::address_man::DiskLocalAddress;
+    use crate::address_man::ReachableNetworks;
+    use crate::node::sync_ctx::SyncNode;
+
+    type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>;
+
+    /// The id of the only address our test nodes know about
+    const PEER_ID: usize = 0;
+
+    /// The anchors a previous run of the node would have left on disk
+    const OLD_ANCHORS: &str = "the anchors we saved on our last run";
+
+    /// A routable address, announcing the services we need to keep it in our address book
+    fn utreexo_address() -> LocalAddress {
+        LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::Ipv4(Ipv4Addr::new(200, 100, 50, 25)), 8333),
+            0,
+            AddressState::NeverTried,
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | service_flags::UTREEXO.into(),
+            PEER_ID,
+        )
+    }
+
+    /// Creates a node with a fresh datadir, knowing about a single utreexo address
+    fn setup_node() -> (TestNode, PathBuf) {
+        let datadir: PathBuf = format!("./tmp-db/{}.peer_man", rand::random::<u32>()).into();
+        std::fs::create_dir_all(&datadir).unwrap();
+
+        // These tests don't care about the chain, so keep the chainstore as small as we can
+        let chainstore_config = FlatChainStoreConfig {
+            block_index_size: Some(32_768),
+            headers_file_size: Some(32_768),
+            fork_file_size: Some(10_000),
+            cache_size: Some(10),
+            file_permission: Some(0o660),
+            path: datadir.clone(),
+        };
+
+        let chainstore = FlatChainStore::new(chainstore_config).unwrap();
+        let chain =
+            ChainState::open(chainstore, Network::Signet, AssumeValidArg::Disabled).unwrap();
+
+        let mut address_man = AddressMan::new(None, &ReachableNetworks::ALL);
+        address_man.push_addresses(&[utreexo_address()]);
+
+        let config = UtreexoNodeConfig {
+            network: Network::Signet,
+            datadir: datadir.clone(),
+            ..Default::default()
+        };
+
+        let node = TestNode::new(
+            config,
+            Arc::new(chain),
+            Arc::new(Mutex::new(Mempool::new(1000))),
+            None,
+            Arc::new(RwLock::new(false)),
+            address_man,
+        )
+        .unwrap();
+
+        (node, datadir)
+    }
+
+    fn read_anchors(datadir: &Path) -> Vec<LocalAddress> {
+        let anchors = std::fs::read_to_string(datadir.join("anchors.json")).unwrap();
+        serde_json::from_str::<Vec<DiskLocalAddress>>(&anchors)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    #[test]
+    fn test_save_utreexo_peers_keeps_old_anchors() {
+        let (mut node, datadir) = setup_node();
+        let anchors = datadir.join("anchors.json");
+        std::fs::write(&anchors, OLD_ANCHORS).unwrap();
+
+        // We don't know about any utreexo peer at all
+        node.save_utreexo_peers()
+            .expect("having no utreexo peers isn't an error");
+
+        // We know about utreexo peers, but none of them is connected right now
+        node.peer_by_service
+            .insert(service_flags::UTREEXO.into(), Vec::new());
+
+        node.save_utreexo_peers()
+            .expect("having no utreexo peers isn't an error");
+
+        // In both cases we should've kept our old anchors, they are all we have to
+        // reconnect with utreexo peers on our next startup
+        assert_eq!(std::fs::read_to_string(&anchors).unwrap(), OLD_ANCHORS);
+    }
+
+    #[test]
+    fn test_save_utreexo_peers_dumps_connected_peers() {
+        let (mut node, datadir) = setup_node();
+        node.peer_by_service
+            .insert(service_flags::UTREEXO.into(), vec![PEER_ID as u32]);
+
+        node.save_utreexo_peers().expect("should dump our anchors");
+
+        assert_eq!(read_anchors(&datadir), vec![utreexo_address()]);
+    }
+
+    #[test]
+    fn test_save_peer_dbs_dumps_both_dbs() {
+        let (mut node, datadir) = setup_node();
+        let peers = datadir.join("peers.json");
+        let anchors = datadir.join("anchors.json");
+
+        // Our address book is saved even if we don't have any utreexo peer to anchor to
+        node.save_peer_dbs().expect("should dump our address book");
+        assert!(peers.exists());
+        assert!(!anchors.exists());
+
+        node.peer_by_service
+            .insert(service_flags::UTREEXO.into(), vec![PEER_ID as u32]);
+
+        node.save_peer_dbs().expect("should dump both dbs");
+        assert!(peers.exists());
+        assert_eq!(read_anchors(&datadir), vec![utreexo_address()]);
     }
 }

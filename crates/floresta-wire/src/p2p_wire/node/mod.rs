@@ -19,6 +19,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use bitcoin::BlockHash;
@@ -418,6 +419,18 @@ where
         }
         try_and_log!(self.save_peers());
         try_and_log!(self.chain.flush());
+    }
+
+    /// Periodic jobs that every context has to run, no matter which one is driving the node
+    ///
+    /// Each context should call this from its maintenance tick, so we don't lose our peer
+    /// databases if we're killed before we get the chance to shutdown cleanly.
+    pub(crate) fn common_periodic_jobs(&mut self) {
+        // Save our peers db
+        periodic_job!(
+            self.last_peer_db_dump => self.save_peer_dbs(),
+            T::PEER_DB_DUMP_INTERVAL,
+        );
     }
 }
 
